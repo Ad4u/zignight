@@ -5,39 +5,70 @@ const miniaudio = @cImport({
     @cInclude("miniaudio.h");
 });
 
+const STREAM_BUFFER_SIZE = std.math.pow(usize, 2, 16);
 const FIFO_SIZE = std.math.pow(usize, 2, 20);
 const START_SIZE = std.math.pow(usize, 2, 16);
 
-// TODO:
-// - Use a big 'shared' struct for synchronization with many mutexes/ResetEvent etc.
-// - Handle radio change: stop sound, clear fifo (discard count), play sound after ring buffer ok.
-// - Handle leaks ? Take thread handles, send 'quit' event to stop the thread, join before exiting.
-// - Change Fifo to RingBuffer
+const Fifo = std.fifo.LinearFifo(u8, .{ .Static = FIFO_SIZE });
 
-const Shared = struct {
-    fifo: std.fifo.LinearFifo(u8, .{ .Static = FIFO_SIZE }),
-    mutex: std.Thread.Mutex,
+const State = struct {
     alloc: std.mem.Allocator,
-    event: ?Events,
-};
+    fifo: Fifo,
+    fifo_mutex: std.Thread.Mutex,
+    net_thread: ?std.Thread,
+    play_thread: ?std.Thread,
+    re_stop: std.Thread.ResetEvent,
+    re_start_player: std.Thread.ResetEvent,
 
-const Events = enum {
-    play,
-    stop,
-    quit,
+    fn init(alloc: std.mem.Allocator) State {
+        return State{
+            .alloc = alloc,
+            .fifo = Fifo.init(),
+            .fifo_mutex = std.Thread.Mutex{},
+            .net_thread = null,
+            .play_thread = null,
+            .re_stop = std.Thread.ResetEvent{},
+            .re_start_player = std.Thread.ResetEvent{},
+        };
+    }
+
+    fn deinit(self: *State) void {
+        self.fifo.deinit();
+    }
+
+    fn start(self: *State) !void {
+        self.re_start_player.reset();
+        self.re_stop.reset();
+
+        self.net_thread = try std.Thread.spawn(.{}, downloader, .{self});
+        self.play_thread = try std.Thread.spawn(.{}, player, .{self});
+        while (self.fifo.count < START_SIZE) {
+            std.Thread.sleep(std.time.ns_per_ms * 20);
+        }
+        self.re_start_player.set();
+    }
+
+    fn stop(self: *State) void {
+        self.re_stop.set();
+        self.net_thread.?.join();
+        self.play_thread.?.join();
+        self.net_thread = null;
+        self.play_thread = null;
+        try self.fifo.pump(self.fifo.reader(), std.io.null_writer);
+    }
 };
 
 fn read(decoder: [*c]miniaudio.ma_decoder, buf: ?*anyopaque, bytes_to_read: usize, bytes_read: [*c]usize) callconv(.c) c_int {
     bytes_read.* = bytes_to_read;
 
-    const shared: *Shared = @alignCast(@ptrCast(decoder.*.pUserData.?));
+    const shared: *State = @alignCast(@ptrCast(decoder.*.pUserData.?));
 
     const anyopaque_pointer: *anyopaque = buf.?;
     const b: []u8 = @as([*]u8, @ptrCast(anyopaque_pointer))[0..bytes_to_read];
 
-    // shared.mutex.lock();
+    shared.fifo_mutex.lock();
     const fifo_read_bytes = shared.fifo.read(b);
-    // shared.mutex.unlock();
+    shared.fifo_mutex.unlock();
     bytes_read.* = fifo_read_bytes;
 
     return 0;
@@ -47,30 +78,31 @@ fn seek(_: [*c]miniaudio.struct_ma_decoder, _: c_longlong, _: c_uint) callconv(.
     return 0;
 }
 
-fn download(s: *Shared) !void {
-    var client = std.http.Client{ .allocator = s.alloc };
+fn downloader(state: *State) !void {
+    var client = std.http.Client{ .allocator = state.alloc };
     var header_buffer: [4096]u8 = undefined;
+    var readbuf: [STREAM_BUFFER_SIZE]u8 = undefined;
     const uri = try std.Uri.parse("https://stream.nightride.fm/nightride.mp3");
-    var request = try client.open(.GET, uri, .{ .server_header_buffer = &header_buffer });
 
+    var request = try client.open(.GET, uri, .{ .server_header_buffer = &header_buffer });
     try request.send();
     try request.finish();
-
     try request.wait();
-
     std.debug.print("Status: {?}\n", .{request.response.status});
-    var readbuf: [65536]u8 = undefined;
 
+    // TODO: Wait on re_stop (timeout wait) instead on read so the thread can be terminated rapidly whatever the state of connection
     while (true) {
+        if (state.re_stop.isSet()) break;
         const n = try request.read(&readbuf);
-        // s.mutex.lock();
-        try s.fifo.write(readbuf[0..n]);
-        // s.mutex.unlock();
+        state.fifo_mutex.lock();
+        try state.fifo.write(readbuf[0..n]);
+        state.fifo_mutex.unlock();
     }
     request.deinit();
+    client.deinit();
 }
 
-fn player(shared: *Shared) !void {
+fn player(shared: *State) !void {
     var res: miniaudio.ma_result = 0;
     const ver = miniaudio.ma_version_string();
     std.debug.print("MA Version: {s}\n", .{ver});
@@ -78,6 +110,8 @@ fn player(shared: *Shared) !void {
     var engine: miniaudio.ma_engine = miniaudio.ma_engine{};
     res = miniaudio.ma_engine_init(null, &engine);
     std.debug.print("Engine Init: {}\n", .{res});
+
+    shared.re_start_player.wait();
 
     var decoder: miniaudio.ma_decoder = miniaudio.ma_decoder{};
     res = miniaudio.ma_decoder_init(read, seek, shared, null, &decoder);
@@ -89,9 +123,12 @@ fn player(shared: *Shared) !void {
 
     _ = miniaudio.ma_sound_start(&sound);
 
-    while (true) {
-        std.Thread.sleep(std.time.ns_per_ms * 500);
-    }
+    shared.re_stop.wait();
+
+    _ = miniaudio.ma_sound_stop(&sound);
+    _ = miniaudio.ma_sound_uninit(&sound);
+    _ = miniaudio.ma_decoder_uninit(&decoder);
+    _ = miniaudio.ma_engine_uninit(&engine);
 }
 
 pub fn main() !void {
@@ -105,19 +142,18 @@ pub fn main() !void {
         _ = debug_allocator.deinit();
     };
 
-    var fifo = std.fifo.LinearFifo(u8, .{ .Static = FIFO_SIZE }).init();
-    defer fifo.deinit();
-    const mutex = std.Thread.Mutex{};
-    var shared = Shared{ .fifo = fifo, .mutex = mutex, .alloc = alloc, .event = null };
+    var state = State.init(alloc);
+    defer state.deinit();
 
-    _ = try std.Thread.spawn(.{}, download, .{&shared});
-
-    while (shared.fifo.count < START_SIZE) {
-        std.Thread.sleep(std.time.ns_per_ms * 10);
-    }
-    // shared.event = .play;
-    _ = try std.Thread.spawn(.{}, player, .{&shared});
+    try state.start();
 
     const stdin = std.io.getStdIn().reader();
     _ = try stdin.readByte();
+
+    state.stop();
+    // _ = try stdin.readByte();
+    // try state.start();
+    // _ = try stdin.readByte();
+
+    // state.stop();
 }
