@@ -11,6 +11,8 @@ const START_SIZE = std.math.pow(usize, 2, 16);
 
 const Fifo = std.fifo.LinearFifo(u8, .{ .Static = FIFO_SIZE });
 
+// TODO: Replace `url` with structs in array and `active` index field
+
 const State = struct {
     alloc: std.mem.Allocator,
     fifo: Fifo,
@@ -19,6 +21,7 @@ const State = struct {
     play_thread: ?std.Thread,
     re_stop: std.Thread.ResetEvent,
     re_start_player: std.Thread.ResetEvent,
+    url: []const u8,
 
     fn init(alloc: std.mem.Allocator) State {
         return State{
@@ -29,6 +32,7 @@ const State = struct {
             .play_thread = null,
             .re_stop = std.Thread.ResetEvent{},
             .re_start_player = std.Thread.ResetEvent{},
+            .url = "",
         };
     }
 
@@ -36,9 +40,11 @@ const State = struct {
         self.fifo.deinit();
     }
 
-    fn start(self: *State) !void {
+    fn start(self: *State, url: []const u8) !void {
         self.re_start_player.reset();
         self.re_stop.reset();
+
+        self.url = url;
 
         self.net_thread = try std.Thread.spawn(.{}, downloader, .{self});
         self.play_thread = try std.Thread.spawn(.{}, player, .{self});
@@ -55,6 +61,7 @@ const State = struct {
         self.net_thread = null;
         self.play_thread = null;
         try self.fifo.pump(self.fifo.reader(), std.io.null_writer);
+        self.url = "";
     }
 };
 
@@ -82,7 +89,7 @@ fn downloader(state: *State) !void {
     var client = std.http.Client{ .allocator = state.alloc };
     var header_buffer: [4096]u8 = undefined;
     var readbuf: [STREAM_BUFFER_SIZE]u8 = undefined;
-    const uri = try std.Uri.parse("https://stream.nightride.fm/nightride.mp3");
+    const uri = try std.Uri.parse(state.url);
 
     var request = try client.open(.GET, uri, .{ .server_header_buffer = &header_buffer });
     try request.send();
@@ -145,15 +152,15 @@ pub fn main() !void {
     var state = State.init(alloc);
     defer state.deinit();
 
-    try state.start();
+    try state.start("https://stream.nightride.fm/nightride.mp3");
 
     const stdin = std.io.getStdIn().reader();
     _ = try stdin.readByte();
 
     state.stop();
-    // _ = try stdin.readByte();
-    // try state.start();
-    // _ = try stdin.readByte();
+    _ = try stdin.readByte();
+    try state.start("https://stream.nightride.fm/chillsynth.mp3");
+    _ = try stdin.readByte();
 
-    // state.stop();
+    state.stop();
 }
