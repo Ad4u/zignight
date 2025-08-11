@@ -7,6 +7,9 @@ const miniaudio = @cImport({
 
 const Data = @import("data.zig");
 
+const WAIT_TIME = std.time.ns_per_ms * 20;
+const FADING_TIME = 200; // ms
+
 const STREAM_BUFFER_SIZE = std.math.pow(usize, 2, 16);
 const METADATA_BUFFER_SIZE = std.math.pow(usize, 2, 14);
 const FIFO_SIZE = std.math.pow(usize, 2, 20);
@@ -14,7 +17,10 @@ const START_SIZE = std.math.pow(usize, 2, 16);
 
 const Fifo = std.fifo.LinearFifo(u8, .{ .Static = FIFO_SIZE });
 
-// TODO: Cleanly terminate the updater thread when quitting the application (new ResetEvent for quit).
+// TODO:
+// Non-blocking reads (to stop threads gracefully and quickly, not waiting for read calls to return)
+// Handle errors/try/catch
+// log to stderr
 
 const State = struct {
     alloc: std.mem.Allocator,
@@ -24,13 +30,14 @@ const State = struct {
     play_thread: ?std.Thread,
     update_thread: ?std.Thread,
     re_stop: std.Thread.ResetEvent,
+    re_quit: std.Thread.ResetEvent,
     re_start_player: std.Thread.ResetEvent,
     stations: []Data.Station,
     stations_mutex: std.Thread.Mutex,
     active_idx: ?usize,
 
     fn init(alloc: std.mem.Allocator) !State {
-        var init_state = State{
+        return State{
             .alloc = alloc,
             .fifo = Fifo.init(),
             .fifo_mutex = std.Thread.Mutex{},
@@ -38,18 +45,20 @@ const State = struct {
             .play_thread = null,
             .update_thread = null,
             .re_stop = std.Thread.ResetEvent{},
+            .re_quit = std.Thread.ResetEvent{},
             .re_start_player = std.Thread.ResetEvent{},
             .stations = &Data.stations_list,
             .stations_mutex = std.Thread.Mutex{},
             .active_idx = null,
         };
-        const handle_updater = try std.Thread.spawn(.{}, updater, .{&init_state});
-        init_state.update_thread = handle_updater;
-        return init_state;
     }
 
     fn deinit(self: *State) void {
         self.fifo.deinit();
+    }
+
+    fn start_updater_thread(self: *State) !void {
+        self.update_thread = try std.Thread.spawn(.{}, updater, .{self});
     }
 
     fn start(self: *State, idx: usize) !void {
@@ -61,12 +70,14 @@ const State = struct {
         self.net_thread = try std.Thread.spawn(.{}, downloader, .{self});
         self.play_thread = try std.Thread.spawn(.{}, player, .{self});
         while (self.fifo.count < START_SIZE) {
-            std.Thread.sleep(std.time.ns_per_ms * 20);
+            std.Thread.sleep(std.time.ns_per_ms * WAIT_TIME);
         }
         self.re_start_player.set();
     }
 
     fn stop(self: *State) void {
+        if (self.active_idx == null) return;
+
         self.re_stop.set();
         self.net_thread.?.join();
         self.play_thread.?.join();
@@ -76,7 +87,15 @@ const State = struct {
         self.active_idx = null;
     }
 
+    fn quit(self: *State) void {
+        self.stop();
+        self.re_quit.set();
+        self.update_thread.?.join();
+        self.update_thread = null;
+    }
+
     fn updateStations(state: *State, new: Data.ParsedData) void {
+        std.debug.print("STATION UPDATE - {s} - {s} - {s}\n", .{ new.station, new.artist, new.title });
         for (state.stations) |*station| {
             if (std.mem.eql(u8, station.meta_name, new.station)) {
                 state.stations_mutex.lock();
@@ -103,10 +122,8 @@ fn updater(state: *State) !void {
     try request.wait();
     std.debug.print("Meta Status: {?}\n", .{request.response.status});
 
-    // TODO: Wait on re_stop (timeout wait) instead on read so the thread can be terminated rapidly whatever the state of connection
-    // ie: poll on read ?
-    // TODO: ResetEvent for closing the thread (on quit)
     while (true) {
+        if (state.re_quit.isSet()) break;
         const line = try request.reader().readUntilDelimiter(&readbuf, '\n');
         if (line.len == 0) continue;
         const json_slice = line[7 .. line.len - 1];
@@ -114,6 +131,8 @@ fn updater(state: *State) !void {
         state.updateStations(parsed.value);
         parsed.deinit();
     }
+    request.deinit();
+    client.deinit();
 }
 
 fn downloader(state: *State) !void {
@@ -128,8 +147,6 @@ fn downloader(state: *State) !void {
     try request.wait();
     std.debug.print("Stream Status: {?}\n", .{request.response.status});
 
-    // TODO: Wait on re_stop (timeout wait) instead on read so the thread can be terminated rapidly whatever the state of connection
-    // ie: poll on read ?
     while (true) {
         if (state.re_stop.isSet()) break;
         const n = try request.read(&readbuf);
@@ -180,10 +197,13 @@ fn player(shared: *State) !void {
     res = miniaudio.ma_sound_init_from_data_source(&engine, &decoder, miniaudio.MA_SOUND_FLAG_STREAM, null, &sound);
     std.debug.print("Sound Init: {}\n", .{res});
 
+    miniaudio.ma_sound_set_fade_in_milliseconds(&sound, 0, 1, FADING_TIME);
     _ = miniaudio.ma_sound_start(&sound);
 
     shared.re_stop.wait();
 
+    miniaudio.ma_sound_set_fade_in_milliseconds(&sound, 1, 0, FADING_TIME);
+    std.Thread.sleep(std.time.ns_per_ms * FADING_TIME);
     _ = miniaudio.ma_sound_stop(&sound);
     _ = miniaudio.ma_sound_uninit(&sound);
     _ = miniaudio.ma_decoder_uninit(&decoder);
@@ -203,11 +223,14 @@ pub fn main() !void {
 
     var state = try State.init(alloc);
     defer state.deinit();
+    try state.start_updater_thread();
 
-    // try state.start(0);
+    try state.start(0);
 
     const stdin = std.io.getStdIn().reader();
     _ = try stdin.readByte();
+
+    state.quit();
 
     // state.stop();
     // _ = try stdin.readByte();
