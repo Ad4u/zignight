@@ -8,7 +8,7 @@ const miniaudio = @cImport({
 const Data = @import("data.zig");
 
 const WAIT_TIME = std.time.ns_per_ms * 20;
-const FADING_TIME = 200; // ms
+const FADING_TIME = 100; // ms
 
 const STREAM_BUFFER_SIZE = std.math.pow(usize, 2, 16);
 const METADATA_BUFFER_SIZE = std.math.pow(usize, 2, 14);
@@ -18,9 +18,9 @@ const START_SIZE = std.math.pow(usize, 2, 16);
 const Fifo = std.fifo.LinearFifo(u8, .{ .Static = FIFO_SIZE });
 
 // TODO:
-// Non-blocking reads (to stop threads gracefully and quickly, not waiting for read calls to return)
 // Handle errors/try/catch
 // log to stderr
+// Handle logic error if playing/stopping too fast (like hit play while stopping joining for faders)
 
 const State = struct {
     alloc: std.mem.Allocator,
@@ -70,7 +70,7 @@ const State = struct {
         self.net_thread = try std.Thread.spawn(.{}, downloader, .{self});
         self.play_thread = try std.Thread.spawn(.{}, player, .{self});
         while (self.fifo.count < START_SIZE) {
-            std.Thread.sleep(std.time.ns_per_ms * WAIT_TIME);
+            std.Thread.sleep(WAIT_TIME);
         }
         self.re_start_player.set();
     }
@@ -95,7 +95,6 @@ const State = struct {
     }
 
     fn updateStations(state: *State, new: Data.ParsedData) void {
-        std.debug.print("STATION UPDATE - {s} - {s} - {s}\n", .{ new.station, new.artist, new.title });
         for (state.stations) |*station| {
             if (std.mem.eql(u8, station.meta_name, new.station)) {
                 state.stations_mutex.lock();
@@ -122,14 +121,33 @@ fn updater(state: *State) !void {
     try request.wait();
     std.debug.print("Meta Status: {?}\n", .{request.response.status});
 
+    var polls: [1]std.posix.pollfd = undefined;
+    polls[0] = .{
+        .fd = request.connection.?.stream.handle,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    };
+
+    var buf_len: usize = 0;
     while (true) {
         if (state.re_quit.isSet()) break;
-        const line = try request.reader().readUntilDelimiter(&readbuf, '\n');
-        if (line.len == 0) continue;
-        const json_slice = line[7 .. line.len - 1];
-        const parsed = std.json.parseFromSlice(Data.ParsedData, state.alloc, json_slice, .{ .ignore_unknown_fields = true }) catch continue;
-        state.updateStations(parsed.value);
-        parsed.deinit();
+
+        buf_len = 0;
+        while (try std.posix.poll(&polls, 20) > 0) {
+            const bytes_read = try request.read(readbuf[buf_len..]);
+            buf_len += bytes_read;
+        }
+
+        if (buf_len == 0) continue;
+
+        var lines = std.mem.tokenizeScalar(u8, readbuf[0..buf_len], '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            const json_slice = line[7 .. line.len - 1];
+            const parsed = std.json.parseFromSlice(Data.ParsedData, state.alloc, json_slice, .{ .ignore_unknown_fields = true }) catch continue;
+            state.updateStations(parsed.value);
+            parsed.deinit();
+        }
     }
     request.deinit();
     client.deinit();
@@ -147,13 +165,24 @@ fn downloader(state: *State) !void {
     try request.wait();
     std.debug.print("Stream Status: {?}\n", .{request.response.status});
 
+    var polls: [1]std.posix.pollfd = undefined;
+    polls[0] = .{
+        .fd = request.connection.?.stream.handle,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    };
+
     while (true) {
         if (state.re_stop.isSet()) break;
-        const n = try request.read(&readbuf);
-        state.fifo_mutex.lock();
-        try state.fifo.write(readbuf[0..n]);
-        state.fifo_mutex.unlock();
+
+        if (try std.posix.poll(&polls, 20) > 0) {
+            const bytes_read = try request.read(&readbuf);
+            state.fifo_mutex.lock();
+            try state.fifo.write(readbuf[0..bytes_read]);
+            state.fifo_mutex.unlock();
+        }
     }
+
     request.deinit();
     client.deinit();
 }
