@@ -2,4 +2,6 @@
 zig-out/
 *.o
 
+logs.txt
+
 .DS_STORE

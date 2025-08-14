@@ -20,7 +20,7 @@ const Fifo = std.fifo.LinearFifo(u8, .{ .Static = FIFO_SIZE });
 
 // TODO:
 // Handle errors in miniaudio thread from miniaudio
-// Handle logic error if playing/stopping too fast (like hit play while stopping joining for faders)
+// Handle disconnections/no connection
 
 const State = struct {
     alloc: std.mem.Allocator,
@@ -35,6 +35,7 @@ const State = struct {
     stations: []Data.Station,
     stations_mutex: std.Thread.Mutex,
     active_idx: ?usize,
+    busy: std.atomic.Value(bool),
 
     fn init(alloc: std.mem.Allocator) !State {
         return State{
@@ -50,11 +51,20 @@ const State = struct {
             .stations = &Data.stations_list,
             .stations_mutex = std.Thread.Mutex{},
             .active_idx = null,
+            .busy = std.atomic.Value(bool).init(false),
         };
     }
 
     fn deinit(self: *State) void {
         self.fifo.deinit();
+    }
+
+    fn setBusy(self: *State, b: bool) void {
+        self.busy.store(b, .monotonic);
+    }
+
+    fn getBusy(self: *State) bool {
+        return self.busy.load(.monotonic);
     }
 
     fn start_updater_thread(self: *State) !void {
@@ -63,7 +73,11 @@ const State = struct {
         log.debug("Updater thread Started", .{});
     }
 
-    fn start(self: *State, idx: usize) !void {
+    fn play(self: *State, idx: usize) !void {
+        log.debug("Play requested", .{});
+        if (self.getBusy()) return;
+
+        self.setBusy(true);
         log.debug("Starting threads for streaming", .{});
         log.debug("Requested station - idx: {} - name: {s}", .{ idx, self.stations[idx].name });
         self.active_idx = idx;
@@ -76,12 +90,15 @@ const State = struct {
         }
         log.debug("Buffer filled. Setting the Event for the player.", .{});
         self.re_start_player.set();
+        self.setBusy(false);
     }
 
     fn stop(self: *State) void {
         log.debug("Stop requested", .{});
+        if (self.getBusy()) return;
         if (self.active_idx == null) return;
 
+        self.setBusy(true);
         self.re_stop.set();
         log.debug("Joining threads", .{});
         self.net_thread.?.join();
@@ -98,11 +115,13 @@ const State = struct {
 
         self.re_start_player.reset();
         self.re_stop.reset();
+        self.setBusy(false);
         log.debug("Streaming stopped", .{});
     }
 
     fn quit(self: *State) void {
         log.debug("Quit requested", .{});
+        self.stop();
         self.re_quit.set();
 
         log.debug("Joining Updater thread", .{});
@@ -305,13 +324,13 @@ pub fn main() void {
         std.process.exit(1);
     };
 
-    state.start(0) catch |err| {
+    state.play(0) catch |err| {
         log.err("Couldn't start the stream: {s}\n", .{@errorName(err)});
     };
 
     const stdin = std.io.getStdIn().reader();
     _ = stdin.readByte() catch unreachable;
 
-    state.stop();
+    // state.stop();
     state.quit();
 }
