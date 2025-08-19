@@ -35,4 +35,7 @@ pub fn build(b: *std.Build) void {
     exe_mod.addCSourceFile(.{ .file = b.path("miniaudio/miniaudio.c") });
     exe.linkLibC();
     exe_check.linkLibC();
+
+    const mibu_dep = b.dependency("mibu", .{ .target = target, .optimize = optimize });
+    exe_mod.addImport("mibu", mibu_dep.module("mibu"));
 }

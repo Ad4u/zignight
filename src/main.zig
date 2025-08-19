@@ -5,6 +5,7 @@ const log = std.log;
 const miniaudio = @cImport({
     @cInclude("miniaudio.h");
 });
+const mibu = @import("mibu");
 
 const Data = @import("data.zig");
 
@@ -76,6 +77,7 @@ const State = struct {
     fn play(self: *State, idx: usize) !void {
         log.debug("Play requested", .{});
         if (self.getBusy()) return;
+        if (self.active_idx != null) return;
 
         self.setBusy(true);
         log.debug("Starting threads for streaming", .{});
@@ -308,29 +310,55 @@ pub fn main() void {
         .Debug, .ReleaseSafe => debug_allocator.allocator(),
         .ReleaseFast, .ReleaseSmall => std.heap.smp_allocator,
     };
-
     defer if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) {
         _ = debug_allocator.deinit();
     };
 
+    launch(alloc) catch |err| {
+        log.err("A critical error occured: {s}", .{@errorName(err)});
+    };
+}
+
+pub fn launch(alloc: std.mem.Allocator) !void {
     var state = State.init(alloc) catch |err| {
         log.err("Couldn't initialize application: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
+    try state.start_updater_thread();
+    defer state.quit();
     defer state.deinit();
 
-    state.start_updater_thread() catch |err| {
-        log.err("Couldn't launch Updater thread: {s}\n", .{@errorName(err)});
+    const stdin = std.io.getStdIn();
+    const stdout = std.io.getStdOut();
+
+    if (!std.posix.isatty(stdin.handle)) {
+        log.err("The program is not running in a terminal. Exiting.", .{});
         std.process.exit(1);
-    };
+    }
 
-    state.play(0) catch |err| {
-        log.err("Couldn't start the stream: {s}\n", .{@errorName(err)});
-    };
+    if (builtin.os.tag == .windows) {
+        try mibu.enableWindowsVTS(stdin.handle);
+    }
 
-    const stdin = std.io.getStdIn().reader();
-    _ = stdin.readByte() catch unreachable;
+    var raw_term = try mibu.term.enableRawMode(stdin.handle);
+    defer raw_term.disableRawMode() catch {};
 
-    // state.stop();
-    state.quit();
+    try mibu.term.enterAlternateScreen(stdout.writer());
+    defer mibu.term.exitAlternateScreen(stdout.writer()) catch {};
+
+    while (true) {
+        const next = try mibu.events.next(stdin);
+        switch (next) {
+            .key => |k| switch (k) {
+                .char => |c| switch (c) {
+                    'q' => break,
+                    'p' => try state.play(0),
+                    's' => state.stop(),
+                    else => {},
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
 }
