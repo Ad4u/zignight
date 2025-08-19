@@ -4,9 +4,9 @@
     .minimum_zig_version = "0.14.1",
     .fingerprint = 0x84959c6fd31cd239,
     .dependencies = .{
-        .mibu = .{
-            .url = "git+https://github.com/xyaman/mibu#415af0fd77ee04d849b291c11cf0800d4e1e753c",
-            .hash = "mibu-0.0.1-AAAAAJOlAADyHymscd3N_b9JJZvJ26yV9OAeD_WGaNZu",
+        .vaxis = .{
+            .url = "git+https://github.com/rockorager/libvaxis#025cf928ffc3ee7a4de36a91f4cca54a5810b2cc",
+            .hash = "vaxis-0.5.1-BWNV_CAVCQAmzxx2i2hBs5SvEupHwDbKHtE5VSOZwwtl",
         },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src", "miniaudio" },

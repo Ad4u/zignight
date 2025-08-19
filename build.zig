@@ -36,6 +36,6 @@ pub fn build(b: *std.Build) void {
     exe.linkLibC();
     exe_check.linkLibC();
 
-    const mibu_dep = b.dependency("mibu", .{ .target = target, .optimize = optimize });
-    exe_mod.addImport("mibu", mibu_dep.module("mibu"));
+    const vaxis_dep = b.dependency("vaxis", .{ .target = target, .optimize = optimize });
+    exe_mod.addImport("vaxis", vaxis_dep.module("vaxis"));
 }

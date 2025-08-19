@@ -5,7 +5,8 @@ const log = std.log;
 const miniaudio = @cImport({
     @cInclude("miniaudio.h");
 });
-const mibu = @import("mibu");
+
+const vaxis = @import("vaxis");
 
 const Data = @import("data.zig");
 
@@ -23,6 +24,12 @@ const Fifo = std.fifo.LinearFifo(u8, .{ .Static = FIFO_SIZE });
 // Handle errors in miniaudio thread from miniaudio
 // Handle disconnections/no connection
 
+const Event = union(enum) {
+    key_press: vaxis.Key,
+    winsize: vaxis.Winsize,
+    request_redraw,
+};
+
 const State = struct {
     alloc: std.mem.Allocator,
     fifo: Fifo,
@@ -36,7 +43,10 @@ const State = struct {
     stations: []Data.Station,
     stations_mutex: std.Thread.Mutex,
     active_idx: ?usize,
+    selected_idx: usize,
     busy: std.atomic.Value(bool),
+    redraw: bool,
+    main_loop: ?*vaxis.Loop(Event),
 
     fn init(alloc: std.mem.Allocator) !State {
         return State{
@@ -52,7 +62,10 @@ const State = struct {
             .stations = &Data.stations_list,
             .stations_mutex = std.Thread.Mutex{},
             .active_idx = null,
+            .selected_idx = 0,
             .busy = std.atomic.Value(bool).init(false),
+            .redraw = true,
+            .main_loop = null,
         };
     }
 
@@ -77,7 +90,8 @@ const State = struct {
     fn play(self: *State, idx: usize) !void {
         log.debug("Play requested", .{});
         if (self.getBusy()) return;
-        if (self.active_idx != null) return;
+        if (self.active_idx == idx) return;
+        if (self.active_idx != null) self.stop();
 
         self.setBusy(true);
         log.debug("Starting threads for streaming", .{});
@@ -121,6 +135,14 @@ const State = struct {
         log.debug("Streaming stopped", .{});
     }
 
+    fn playStop(self: *State, idx: usize) !void {
+        if (self.active_idx == idx) {
+            self.stop();
+        } else {
+            try self.play(idx);
+        }
+    }
+
     fn quit(self: *State) void {
         log.debug("Quit requested", .{});
         self.stop();
@@ -132,17 +154,29 @@ const State = struct {
         log.debug("Thread joined. Quit process finished", .{});
     }
 
-    fn updateStations(state: *State, new: Data.ParsedData) void {
+    fn updateStations(self: *State, new: Data.ParsedData) void {
         log.info("Update station: {s} - artist: {s} - title: {s}", .{ new.station, new.artist, new.title });
-        for (state.stations) |*station| {
+        self.stations_mutex.lock();
+        for (self.stations) |*station| {
             if (std.mem.eql(u8, station.meta_name, new.station)) {
-                state.stations_mutex.lock();
                 station.artist = new.artist;
                 station.title = new.title;
-                state.stations_mutex.unlock();
                 break;
             }
         }
+        self.stations_mutex.unlock();
+
+        if (self.main_loop != null) self.main_loop.?.postEvent(Event{ .request_redraw = {} });
+    }
+
+    fn selectedInc(self: *State) void {
+        if (self.selected_idx == self.stations.len - 1) return;
+        self.selected_idx += 1;
+    }
+
+    fn selectedDec(self: *State) void {
+        if (self.selected_idx == 0) return;
+        self.selected_idx -= 1;
     }
 };
 
@@ -328,37 +362,61 @@ pub fn launch(alloc: std.mem.Allocator) !void {
     defer state.quit();
     defer state.deinit();
 
-    const stdin = std.io.getStdIn();
-    const stdout = std.io.getStdOut();
+    var tty = try vaxis.Tty.init();
+    defer tty.deinit();
 
-    if (!std.posix.isatty(stdin.handle)) {
-        log.err("The program is not running in a terminal. Exiting.", .{});
-        std.process.exit(1);
-    }
+    var vx = try vaxis.init(alloc, .{});
+    defer vx.deinit(alloc, tty.anyWriter());
 
-    if (builtin.os.tag == .windows) {
-        try mibu.enableWindowsVTS(stdin.handle);
-    }
+    var loop: vaxis.Loop(Event) = .{
+        .tty = &tty,
+        .vaxis = &vx,
+    };
+    try loop.init();
+    try loop.start();
+    defer loop.stop();
 
-    var raw_term = try mibu.term.enableRawMode(stdin.handle);
-    defer raw_term.disableRawMode() catch {};
+    state.main_loop = &loop;
+    loop.postEvent(Event{ .request_redraw = {} });
 
-    try mibu.term.enterAlternateScreen(stdout.writer());
-    defer mibu.term.exitAlternateScreen(stdout.writer()) catch {};
+    try vx.enterAltScreen(tty.anyWriter());
+    defer vx.exitAltScreen(tty.anyWriter()) catch {};
+
+    try vx.queryTerminal(tty.anyWriter(), std.time.ns_per_s * 1);
 
     while (true) {
-        const next = try mibu.events.next(stdin);
-        switch (next) {
-            .key => |k| switch (k) {
-                .char => |c| switch (c) {
-                    'q' => break,
-                    'p' => try state.play(0),
-                    's' => state.stop(),
-                    else => {},
-                },
-                else => {},
+        const event = loop.nextEvent();
+        switch (event) {
+            .key_press => |key| {
+                if (key.matches('q', .{})) break;
+                if (key.codepoint == vaxis.Key.enter) try state.playStop(state.selected_idx);
+                if (key.codepoint == vaxis.Key.down) state.selectedInc();
+                if (key.codepoint == vaxis.Key.up) state.selectedDec();
+
+                loop.postEvent(Event{ .request_redraw = {} });
             },
-            else => {},
+            .winsize => |ws| try vx.resize(alloc, tty.anyWriter(), ws),
+            .request_redraw => {
+                log.debug("Redraw requested", .{});
+                const win = vx.window();
+                win.clear();
+
+                var idx: u8 = 0;
+                for (state.stations, 0..) |station, i| {
+                    const play_child = win.child(.{ .height = 1, .width = 1, .x_off = 0, .y_off = idx });
+                    if (i == state.selected_idx) {
+                        _ = play_child.printSegment(.{ .text = "X" }, .{});
+                    }
+                    const child = win.child(.{ .height = 1, .width = 42, .x_off = 2, .y_off = idx });
+
+                    var s = vaxis.Style{};
+                    if (state.active_idx == idx) s.reverse = true;
+                    _ = child.printSegment(.{ .text = station.name, .style = s }, .{});
+                    idx += 1;
+                }
+
+                try vx.render(tty.anyWriter());
+            },
         }
     }
 }
