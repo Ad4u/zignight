@@ -70,6 +70,10 @@ const State = struct {
     }
 
     fn deinit(self: *State) void {
+        for (self.stations) |station| {
+            self.alloc.free(station.artist);
+            self.alloc.free(station.title);
+        }
         self.fifo.deinit();
     }
 
@@ -154,13 +158,15 @@ const State = struct {
         log.debug("Thread joined. Quit process finished", .{});
     }
 
-    fn updateStations(self: *State, new: Data.ParsedData) void {
+    fn updateStations(self: *State, new: Data.ParsedData) !void {
         log.info("Update station: {s} - artist: {s} - title: {s}", .{ new.station, new.artist, new.title });
         self.stations_mutex.lock();
         for (self.stations) |*station| {
             if (std.mem.eql(u8, station.meta_name, new.station)) {
-                station.artist = new.artist;
-                station.title = new.title;
+                self.alloc.free(station.artist);
+                self.alloc.free(station.title);
+                station.artist = try self.alloc.dupe(u8, new.artist);
+                station.title = try self.alloc.dupe(u8, new.title);
                 break;
             }
         }
@@ -222,7 +228,7 @@ fn updater(state: *State) !void {
             if (line.len == 0) continue;
             const json_slice = line[7 .. line.len - 1];
             const parsed = std.json.parseFromSlice(Data.ParsedData, state.alloc, json_slice, .{ .ignore_unknown_fields = true }) catch continue;
-            state.updateStations(parsed.value);
+            try state.updateStations(parsed.value);
             parsed.deinit();
         }
     }
@@ -395,9 +401,12 @@ pub fn launch(alloc: std.mem.Allocator) !void {
 
                 loop.postEvent(Event{ .request_redraw = {} });
             },
-            .winsize => |ws| try vx.resize(alloc, tty.anyWriter(), ws),
+            .winsize => |ws| {
+                try vx.resize(alloc, tty.anyWriter(), ws);
+                loop.postEvent(Event{ .request_redraw = {} });
+            },
             .request_redraw => {
-                log.debug("Redraw requested", .{});
+                var arena = std.heap.ArenaAllocator.init(state.alloc);
                 const win = vx.window();
                 win.clear();
 
@@ -407,15 +416,18 @@ pub fn launch(alloc: std.mem.Allocator) !void {
                     if (i == state.selected_idx) {
                         _ = play_child.printSegment(.{ .text = "X" }, .{});
                     }
-                    const child = win.child(.{ .height = 1, .width = 42, .x_off = 2, .y_off = idx });
+                    const child = win.child(.{ .height = 1, .width = win.width, .x_off = 2, .y_off = idx });
+
+                    const txt = try std.fmt.allocPrint(arena.allocator(), "{s} - {s} - {s}", .{ station.name, station.artist, station.title });
 
                     var s = vaxis.Style{};
                     if (state.active_idx == idx) s.reverse = true;
-                    _ = child.printSegment(.{ .text = station.name, .style = s }, .{});
+                    _ = child.printSegment(.{ .text = txt, .style = s }, .{});
                     idx += 1;
                 }
 
                 try vx.render(tty.anyWriter());
+                arena.deinit();
             },
         }
     }
