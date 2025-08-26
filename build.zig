@@ -4,10 +4,16 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const strip = switch (optimize) {
+        .Debug, .ReleaseSafe => false,
+        .ReleaseSmall, .ReleaseFast => true,
+    };
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
     });
 
     const exe = b.addExecutable(.{
@@ -36,6 +42,9 @@ pub fn build(b: *std.Build) void {
     exe.linkLibC();
     exe_check.linkLibC();
 
-    const vaxis_dep = b.dependency("vaxis", .{ .target = target, .optimize = optimize });
+    const vaxis_dep = b.dependency("vaxis", .{
+        .target = target,
+        .optimize = optimize,
+    });
     exe_mod.addImport("vaxis", vaxis_dep.module("vaxis"));
 }
