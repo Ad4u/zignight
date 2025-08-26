@@ -5,8 +5,8 @@
     .fingerprint = 0x84959c6fd31cd239,
     .dependencies = .{
         .vaxis = .{
-            .url = "git+https://github.com/rockorager/libvaxis#025cf928ffc3ee7a4de36a91f4cca54a5810b2cc",
-            .hash = "vaxis-0.5.1-BWNV_CAVCQAmzxx2i2hBs5SvEupHwDbKHtE5VSOZwwtl",
+            .url = "git+https://github.com/rockorager/libvaxis#de4f564ba281e9ed4df65834d00727d88f56632b",
+            .hash = "vaxis-0.5.1-BWNV_JIWCQAoX8lZ-5eLf-sFzA-h7aXvNNEenyC2b83s",
         },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src", "miniaudio" },

@@ -220,7 +220,6 @@ fn updater(state: *State) !void {
             const bytes_read = try request.read(readbuf[buf_len..]);
             buf_len += bytes_read;
         }
-
         if (buf_len == 0) continue;
 
         var lines = std.mem.tokenizeScalar(u8, readbuf[0..buf_len], '\n');
@@ -407,22 +406,26 @@ pub fn launch(alloc: std.mem.Allocator) !void {
             },
             .request_redraw => {
                 var arena = std.heap.ArenaAllocator.init(state.alloc);
+                var arena_alloc = arena.allocator();
                 const win = vx.window();
                 win.clear();
 
                 var idx: u8 = 0;
-                for (state.stations, 0..) |station, i| {
-                    const play_child = win.child(.{ .height = 1, .width = 1, .x_off = 0, .y_off = idx });
-                    if (i == state.selected_idx) {
-                        _ = play_child.printSegment(.{ .text = "X" }, .{});
-                    }
-                    const child = win.child(.{ .height = 1, .width = win.width, .x_off = 2, .y_off = idx });
-
-                    const txt = try std.fmt.allocPrint(arena.allocator(), "{s} - {s} - {s}", .{ station.name, station.artist, station.title });
-
+                for (state.stations) |station| {
                     var s = vaxis.Style{};
                     if (state.active_idx == idx) s.reverse = true;
-                    _ = child.printSegment(.{ .text = txt, .style = s }, .{});
+                    const station_child = win.child(.{ .height = 4, .width = 60, .x_off = 0, .y_off = idx * 4, .border = .{ .where = .all } });
+                    _ = win.printSegment(.{ .text = station.name, .style = s }, .{ .col_offset = 2, .row_offset = idx * 4 });
+
+                    if (state.selected_idx == idx) {
+                        _ = win.printSegment(.{ .text = "⏵" }, .{ .col_offset = 1, .row_offset = idx * 4 });
+                    }
+
+                    const artist = try arena_alloc.dupe(u8, station.artist);
+                    const title = try arena_alloc.dupe(u8, station.title);
+                    _ = station_child.printSegment(.{ .text = artist }, .{ .col_offset = 2, .row_offset = 0 });
+                    _ = station_child.printSegment(.{ .text = title }, .{ .col_offset = 2, .row_offset = 1 });
+
                     idx += 1;
                 }
 
