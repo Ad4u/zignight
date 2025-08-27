@@ -9,12 +9,30 @@ pub fn build(b: *std.Build) void {
         .ReleaseSmall, .ReleaseFast => true,
     };
 
+    const miniaudio_dep = b.dependency("miniaudio", .{});
+
+    const miniaudio_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .strip = strip,
+    });
+    miniaudio_mod.addIncludePath(miniaudio_dep.path("."));
+    miniaudio_mod.addCSourceFile(.{ .file = miniaudio_dep.path("miniaudio.c") });
+
+    const miniaudio = b.addLibrary(.{
+        .name = "miniaudio",
+        .root_module = miniaudio_mod,
+    });
+    miniaudio.installHeader(miniaudio_dep.path("miniaudio.h"), "miniaudio.h");
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         .strip = strip,
     });
+    exe_mod.linkLibrary(miniaudio);
 
     const exe = b.addExecutable(.{
         .name = "zignight",
@@ -36,11 +54,6 @@ pub fn build(b: *std.Build) void {
     }
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
-
-    exe_mod.addIncludePath(b.path("miniaudio"));
-    exe_mod.addCSourceFile(.{ .file = b.path("miniaudio/miniaudio.c") });
-    exe.linkLibC();
-    exe_check.linkLibC();
 
     const vaxis_dep = b.dependency("vaxis", .{
         .target = target,
