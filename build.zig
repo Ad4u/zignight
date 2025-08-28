@@ -42,6 +42,10 @@ pub fn build(b: *std.Build) void {
     exe.linkLibC();
     exe_check.linkLibC();
 
+    if (target.result.os.tag == .macos) {
+        exe.addFrameworkPath(std.Build.LazyPath{ .cwd_relative = "/Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk/System/Library/Frameworks" });
+    }
+
     const vaxis_dep = b.dependency("vaxis", .{
         .target = target,
         .optimize = optimize,
